@@ -53,7 +53,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                       const uint32_t num_threads, const uint32_t recall_at, const uint32_t beamwidth,
                       const uint32_t num_nodes_to_cache, const uint32_t search_io_limit,
                       const std::vector<uint32_t> &Lvec, const float fail_if_recall_below,
-                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false)
+                      const std::vector<std::string> &query_filters, const bool use_reorder_data = false, const bool use_coro = false)
 {
     diskann::cout << "Search parameters: #threads: " << num_threads << ", ";
     if (beamwidth <= 0)
@@ -66,6 +66,10 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         diskann::cout << ", io_limit: " << search_io_limit << "." << std::endl;
 
     std::string warmup_query_file = index_path_prefix + "_sample_data.bin";
+
+    if(use_coro){
+        std::cout<<"Using coroutine."<<std::endl;
+    }
 
     // load query bin
     T *query = nullptr;
@@ -179,7 +183,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     std::string recall_string = "Recall@" + std::to_string(recall_at);
     diskann::cout << std::setw(6) << "L" << std::setw(12) << "Beamwidth" << std::setw(16) << "QPS" << std::setw(16)
                   << "Mean Latency" << std::setw(16) << "99.9 Latency" << std::setw(16) << "Mean IOs" << std::setw(16)
-                  << "CPU (s)";
+                  << "Mean IO (us)"<< std::setw(16)<< "Mean CPU (us)"<< std::setw(16)<< "numBlockVisited";
     if (calc_recall_flag)
     {
         diskann::cout << std::setw(16) << recall_string << std::endl;
@@ -187,13 +191,13 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
     else
         diskann::cout << std::endl;
     diskann::cout << "==============================================================="
-                     "======================================================="
+                     "==============================================================="
                   << std::endl;
 
     std::vector<std::vector<uint32_t>> query_result_ids(Lvec.size());
     std::vector<std::vector<float>> query_result_dists(Lvec.size());
 
-    uint32_t optimized_beamwidth = 2;
+    uint32_t optimized_beamwidth = 10;
 
     double best_recall = 0.0;
 
@@ -215,6 +219,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         }
         else
             optimized_beamwidth = beamwidth;
+            // optimized_beamwidth = 10;
 
         query_result_ids[test_id].resize(recall_at * query_num);
         query_result_dists[test_id].resize(recall_at * query_num);
@@ -224,6 +229,8 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         std::vector<uint64_t> query_result_ids_64(recall_at * query_num);
         auto s = std::chrono::high_resolution_clock::now();
 
+
+// TODO 进行单个query的逐次处理
 #pragma omp parallel for schedule(dynamic, 1)
         for (int64_t i = 0; i < (int64_t)query_num; i++)
         {
@@ -232,7 +239,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                 _pFlashIndex->cached_beam_search(query + (i * query_aligned_dim), recall_at, L,
                                                  query_result_ids_64.data() + (i * recall_at),
                                                  query_result_dists[test_id].data() + (i * recall_at),
-                                                 optimized_beamwidth, use_reorder_data, stats + i);
+                                                 optimized_beamwidth, use_reorder_data, use_coro, stats + i);
             }
             else
             {
@@ -248,7 +255,7 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
                 _pFlashIndex->cached_beam_search(
                     query + (i * query_aligned_dim), recall_at, L, query_result_ids_64.data() + (i * recall_at),
                     query_result_dists[test_id].data() + (i * recall_at), optimized_beamwidth, true, label_for_search,
-                    use_reorder_data, stats + i);
+                    use_reorder_data, use_coro, stats + i);
             }
         }
         auto e = std::chrono::high_resolution_clock::now();
@@ -267,6 +274,9 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
         auto mean_ios = diskann::get_mean_stats<uint32_t>(stats, query_num,
                                                           [](const diskann::QueryStats &stats) { return stats.n_ios; });
 
+        auto mean_ious = diskann::get_mean_stats<float>(stats, query_num,
+                                                         [](const diskann::QueryStats &stats) { return stats.io_us; });
+
         auto mean_cpuus = diskann::get_mean_stats<float>(stats, query_num,
                                                          [](const diskann::QueryStats &stats) { return stats.cpu_us; });
 
@@ -278,9 +288,21 @@ int search_disk_index(diskann::Metric &metric, const std::string &index_path_pre
             best_recall = std::max(recall, best_recall);
         }
 
+
+        // Locality Stats Output
+        auto locality_map = diskann::get_disk_locality_stats(stats,query_num);
+        auto numBlockVisited = locality_map.size();
+        std::string cur_block_map_result_path = index_path_prefix + "_" + std::to_string(L) + "_locality_map.bin";
+        diskann::exportLocalityMapToCSV(cur_block_map_result_path, locality_map);
+
+        // io time per read.
+        std::string ious_per_read_path = index_path_prefix + "_" + std::to_string(L) + "_ious_per_read.bin";
+        diskann::exportIOTimeToCSV(ious_per_read_path,stats, query_num);
+        
+
         diskann::cout << std::setw(6) << L << std::setw(12) << optimized_beamwidth << std::setw(16) << qps
                       << std::setw(16) << mean_latency << std::setw(16) << latency_999 << std::setw(16) << mean_ios
-                      << std::setw(16) << mean_cpuus;
+                      << std::setw(16) << mean_ious << std::setw(16) << mean_cpuus << std::setw(16) << numBlockVisited;
         if (calc_recall_flag)
         {
             diskann::cout << std::setw(16) << recall << std::endl;
@@ -317,6 +339,7 @@ int main(int argc, char **argv)
     uint32_t num_threads, K, W, num_nodes_to_cache, search_io_limit;
     std::vector<uint32_t> Lvec;
     bool use_reorder_data = false;
+    bool use_coro = false;
     float fail_if_recall_below = 0.0f;
 
     po::options_description desc{
@@ -347,7 +370,7 @@ int main(int argc, char **argv)
         po::options_description optional_configs("Optional");
         optional_configs.add_options()("gt_file", po::value<std::string>(&gt_file)->default_value(std::string("null")),
                                        program_options_utils::GROUND_TRUTH_FILE_DESCRIPTION);
-        optional_configs.add_options()("beamwidth,W", po::value<uint32_t>(&W)->default_value(2),
+        optional_configs.add_options()("beamwidth,W", po::value<uint32_t>(&W)->default_value(20),
                                        program_options_utils::BEAMWIDTH);
         optional_configs.add_options()("num_nodes_to_cache", po::value<uint32_t>(&num_nodes_to_cache)->default_value(0),
                                        program_options_utils::NUMBER_OF_NODES_TO_CACHE);
@@ -372,6 +395,7 @@ int main(int argc, char **argv)
         optional_configs.add_options()("fail_if_recall_below",
                                        po::value<float>(&fail_if_recall_below)->default_value(0.0f),
                                        program_options_utils::FAIL_IF_RECALL_BELOW);
+        optional_configs.add_options()("use_coro",po::bool_switch()->default_value(false),"If use coroutine in ssd IO");
 
         // Merge required and optional parameters
         desc.add(required_configs).add(optional_configs);
@@ -386,6 +410,9 @@ int main(int argc, char **argv)
         po::notify(vm);
         if (vm["use_reorder_data"].as<bool>())
             use_reorder_data = true;
+        if (vm["use_coro"].as<bool>()){
+            use_coro = true;
+        }
     }
     catch (const std::exception &ex)
     {
@@ -442,6 +469,10 @@ int main(int argc, char **argv)
     else if (query_filters_file != "")
     {
         query_filters = read_file_to_vector_of_strings(query_filters_file);
+    }
+
+    if(use_coro){
+        std::cout<<"Using coro in disk IO"<<std::endl;
     }
 
     try

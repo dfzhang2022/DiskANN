@@ -4,6 +4,7 @@
 #pragma once
 
 #include <errno.h>
+#include <unordered_map>
 
 #include "common_includes.h"
 

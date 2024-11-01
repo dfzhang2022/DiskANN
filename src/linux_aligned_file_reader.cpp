@@ -3,17 +3,127 @@
 
 #include "linux_aligned_file_reader.h"
 
+#include "coroutine_execute_io.cpp"
+
+#include <boost/asio.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/coroutine2/all.hpp>
 #include <cassert>
 #include <cstdio>
 #include <iostream>
+#include <liburing.h>
+#include <coroutine>
 #include "tsl/robin_map.h"
 #include "utils.h"
+#include <future>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <libaio.h>
+#include <chrono>
 #define MAX_EVENTS 1024
+
+
+// 定义协程任务
+// struct Task {
+//     struct promise_type;
+//     using handle_type = std::coroutine_handle<promise_type>;
+
+//     handle_type coro;
+
+//     Task(handle_type h) : coro(h) {}
+//     ~Task() {
+//         if (coro) coro.destroy();
+//     }
+//     bool await_ready() const noexcept { return false; }
+//     void await_suspend(std::coroutine_handle<>) const noexcept {}
+//     void await_resume() const noexcept {}
+
+//     struct promise_type {
+//         auto get_return_object() { return Task{handle_type::from_promise(*this)}; }
+//         std::suspend_never initial_suspend() { return {}; }
+//         std::suspend_always final_suspend() noexcept { return {}; }
+//         void return_void() {}
+//         void unhandled_exception() { std::terminate(); }
+//     };
+// };
+
+// // 异步 I/O 操作的协程函数
+// Task async_read(io_context_t ctx, int fd, AlignedRead& read_req) {
+//     struct iocb cb;
+//     struct iocb* cbs[1] = { &cb };
+//     io_prep_pread(&cb, fd, read_req.buf, read_req.len, read_req.offset);
+
+//     int ret = io_submit(ctx, 1, cbs);
+//     if (ret < 0) {
+//         std::cerr << "io_submit failed: " << strerror(-ret) << "\n";
+//         co_return;
+//     }
+
+//     // 挂起协程，等待 I/O 完成
+//     struct io_event evt;
+//     ret = io_getevents(ctx, 1, 1, &evt, nullptr);
+//     if (ret < 0) {
+//         std::cerr << "io_getevents failed: " << strerror(-ret) << "\n";
+//     }
+//     co_return;
+// }
+
+// // 协程驱动的批量 I/O 函数
+// Task coroutine_execute_io(io_context_t ctx, int fd, std::vector<AlignedRead>& read_reqs) {
+//     for (auto& req : read_reqs) {
+//         co_await async_read(ctx, fd, req);
+//     }
+//     co_return;
+// }
+
+
+// using namespace boost::coroutines2;
+// void co_push_fun1(coroutine<int>::push_type& yield,int a){
+//     for(int i = 0; i < a;i++){
+//         // logic before
+//     }
+// }
 
 namespace
 {
 typedef struct io_event io_event_t;
 typedef struct iocb iocb_t;
+
+
+
+
+void async_execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, uint64_t n_retries = 0) {
+    std::vector<std::future<void>> futures;
+    
+    for (auto &req : read_reqs) {
+        futures.emplace_back(std::async(std::launch::async, [&, fd, req]() {
+            // 尝试多次以应对读取失败
+            for (uint64_t attempt = 0; attempt <= n_retries; ++attempt) {
+                if (lseek(fd, req.offset, SEEK_SET) == -1) {
+                    std::cerr << "Error seeking in file: " << strerror(errno) << std::endl;
+                    return;
+                }
+                
+                ssize_t bytesRead = read(fd, req.buf, req.len);
+                if (bytesRead == -1) {
+                    if (attempt == n_retries) {
+                        std::cerr << "Error reading file after " << n_retries << " retries: " << strerror(errno) << std::endl;
+                        return;
+                    }
+                } else {
+                    // 成功读取后退出重试循环
+                    break;
+                }
+            }
+        }));
+    }
+
+    // 等待所有 I/O 操作完成
+    for (auto &fut : futures) {
+        fut.get();
+    }
+}
 
 void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, uint64_t n_retries = 0)
 {
@@ -30,6 +140,7 @@ void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, u
 
     // break-up requests into chunks of size MAX_EVENTS each
     uint64_t n_iters = ROUND_UP(read_reqs.size(), MAX_EVENTS) / MAX_EVENTS;
+    if(n_iters >1)std::cout<<"n_iters >1, = "<<n_iters<<std::endl;
     for (uint64_t iter = 0; iter < n_iters; iter++)
     {
         uint64_t n_ops = std::min((uint64_t)read_reqs.size() - (iter * MAX_EVENTS), (uint64_t)MAX_EVENTS);
@@ -51,9 +162,11 @@ void execute_io(io_context_t ctx, int fd, std::vector<AlignedRead> &read_reqs, u
         }
 
         uint64_t n_tries = 0;
+        // No retries in default.
         while (n_tries <= n_retries)
         {
-            // issue reads
+            // issue each iter reads
+            // iter size = 1024 in default
             int64_t ret = io_submit(ctx, (int64_t)n_ops, cbs.data());
             // if requests didn't get accepted
             if (ret != (int64_t)n_ops)
@@ -219,10 +332,16 @@ void LinuxAlignedFileReader::close()
 
 void LinuxAlignedFileReader::read(std::vector<AlignedRead> &read_reqs, io_context_t &ctx, bool async)
 {
-    if (async == true)
-    {
-        diskann::cout << "Async currently not supported in linux." << std::endl;
-    }
+    // if (async == true)
+    // {
+    //     diskann::cout << "Async currently not supported in linux." << std::endl;
+    // }
     assert(this->file_desc != -1);
-    execute_io(ctx, this->file_desc, read_reqs);
+
+    if(!async){
+        execute_io(ctx, this->file_desc, read_reqs);
+    }else{
+        BQANN::coro_execute_IO(this->file_desc, read_reqs);
+    }
+
 }

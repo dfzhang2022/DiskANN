@@ -1251,31 +1251,32 @@ bool getNextCompletedRequest(std::shared_ptr<AlignedFileReader> &reader, IOConte
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
-                                                 const bool use_reorder_data, QueryStats *stats)
+                                                 const bool use_reorder_data, const bool use_coro, QueryStats *stats)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, std::numeric_limits<uint32_t>::max(),
-                       use_reorder_data, stats);
+                       use_reorder_data, use_coro, stats);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
-                                                 const bool use_reorder_data, QueryStats *stats)
+                                                 const bool use_reorder_data, const bool use_coro, QueryStats *stats)
 {
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, use_filter, filter_label,
-                       std::numeric_limits<uint32_t>::max(), use_reorder_data, stats);
+                       std::numeric_limits<uint32_t>::max(), use_reorder_data, use_coro, stats);
 }
 
 template <typename T, typename LabelT>
 void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t k_search, const uint64_t l_search,
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const uint32_t io_limit, const bool use_reorder_data,
+                                                 const bool use_coro,
                                                  QueryStats *stats)
 {
     LabelT dummy_filter = 0;
     cached_beam_search(query1, k_search, l_search, indices, distances, beam_width, false, dummy_filter, io_limit,
-                       use_reorder_data, stats);
+                       use_reorder_data, use_coro, stats);
 }
 
 template <typename T, typename LabelT>
@@ -1283,6 +1284,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                                                  uint64_t *indices, float *distances, const uint64_t beam_width,
                                                  const bool use_filter, const LabelT &filter_label,
                                                  const uint32_t io_limit, const bool use_reorder_data,
+                                                 const bool use_coro,
                                                  QueryStats *stats)
 {
 
@@ -1290,7 +1292,6 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
     if (beam_width > num_sector_per_nodes * defaults::MAX_N_SECTOR_READS)
         throw ANNException("Beamwidth can not be higher than defaults::MAX_N_SECTOR_READS", -1, __FUNCSIG__, __FILE__,
                            __LINE__);
-
     ScratchStoreManager<SSDThreadData<T>> manager(this->_thread_data);
     auto data = manager.scratch_space();
     IOContext &ctx = data->ctx;
@@ -1459,7 +1460,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 reinterpret_cast<std::atomic<uint32_t> &>(this->_node_visit_counter[nbr.id].second).fetch_add(1);
             }
-        }
+        } // end while
 
         // read nhoods of frontier ids
         if (!frontier.empty())
@@ -1480,6 +1481,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                 {
                     stats->n_4k++;
                     stats->n_ios++;
+                    //TODO 添加对于访问块数的统计
+                    uint64_t tmp_sector_id = get_node_sector((size_t)id);
+                    stats->blockVisted[tmp_sector_id]++;
+                    
                 }
                 num_ios++;
             }
@@ -1488,13 +1493,22 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             reader->read(frontier_read_reqs, ctx,
                          true); // asynhronous reader for Bing.
 #else
-            reader->read(frontier_read_reqs, ctx); // synchronous IO linux
+            if(!use_coro){
+                reader->read(frontier_read_reqs, ctx, false); // synchronous IO linux 
+            }else{
+                // TODO coroutine
+                reader->read(frontier_read_reqs, ctx, true);// coroutine IO linux
+            }
+            
+
 #endif
             if (stats != nullptr)
             {
-                stats->io_us += (float)io_timer.elapsed();
+                float io_us_per_read =  (float)io_timer.elapsed();
+                stats->io_us += io_us_per_read;
+                stats->io_us_per_read_pair_vec.push_back(std::pair(frontier_read_reqs.size(), io_us_per_read));
             }
-        }
+        } // end if 
 
         // process cached nhoods
         for (auto &cached_nhood : cached_nhoods)
@@ -1546,7 +1560,7 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
                     retset.insert(nn);
                 }
             }
-        }
+        }// end for
 #ifdef USE_BING_INFRA
         // process each frontier nhood - compute distances to unvisited nodes
         int completedIndex = -1;
@@ -1619,10 +1633,10 @@ void PQFlashIndex<T, LabelT>::cached_beam_search(const T *query1, const uint64_t
             {
                 stats->cpu_us += (float)cpu_timer.elapsed();
             }
-        }
+        }// end for
 
         hops++;
-    }
+    } // while (retset.has_unexpanded_node() && num_ios < io_limit)
 
     // re-sort by distance
     std::sort(full_retset.begin(), full_retset.end());

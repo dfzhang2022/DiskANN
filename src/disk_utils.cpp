@@ -1297,6 +1297,10 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
     }
     size_t num_pq_chunks = (size_t)(std::floor)(uint64_t(final_index_ram_limit / points_num));
 
+    std::cout << "num_pq_chunks is " << num_pq_chunks
+              << " ,final_index_ram_limit is " << final_index_ram_limit
+              << " , points_num is " << points_num << std::endl;
+
     num_pq_chunks = num_pq_chunks <= 0 ? 1 : num_pq_chunks;
     num_pq_chunks = num_pq_chunks > dim ? dim : num_pq_chunks;
     num_pq_chunks = num_pq_chunks > MAX_PQ_CHUNKS ? MAX_PQ_CHUNKS : num_pq_chunks;
@@ -1308,7 +1312,7 @@ int build_disk_index(const char *dataFilePath, const char *indexFilePath, const 
                   << std::endl;
         num_pq_chunks = atoi(param_list[8].c_str());
     }
-
+    // num pq chunks 是说每一个向量被转换成的PQ
     diskann::cout << "Compressing " << dim << "-dimensional data into " << num_pq_chunks << " bytes per vector."
                   << std::endl;
 
